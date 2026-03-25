@@ -16,10 +16,22 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Initialize Firebase Admin SDK
+// ===================== FIREBASE INITIALIZATION =====================
+// Initialize Firebase Admin SDK with proper environment variable handling
 try {
-    // For production on Render - use environment variables
-    if (process.env.FIREBASE_PRIVATE_KEY) {
+    // Check for Firebase credentials in environment variables
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        // Production on Render - use single environment variable
+        console.log('🔐 Initializing Firebase from FIREBASE_SERVICE_ACCOUNT env var...');
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('✅ Firebase initialized successfully from environment variable');
+    } 
+    else if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL) {
+        // Alternative: Use individual environment variables (if you prefer this method)
+        console.log('🔐 Initializing Firebase from individual env vars...');
         admin.initializeApp({
             credential: admin.credential.cert({
                 projectId: process.env.FIREBASE_PROJECT_ID,
@@ -27,19 +39,29 @@ try {
                 privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
             })
         });
-    } else {
-        // For local development - use service account file
+        console.log('✅ Firebase initialized successfully from individual env vars');
+    }
+    else {
+        // Local development - use service account file
+        console.log('📁 Initializing Firebase from local serviceAccountKey.json file...');
         const serviceAccount = require('./serviceAccountKey.json');
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
+        console.log('✅ Firebase initialized successfully from local file');
     }
-    console.log('✅ Firebase Admin initialized');
 } catch (error) {
-    console.error('❌ Firebase Admin error:', error.message);
+    console.error('❌ Firebase Admin initialization error:', error.message);
+    console.error('Stack trace:', error.stack);
+    // Don't exit - let the app start but with limited functionality
 }
 
-const db = admin.firestore();
+// Get Firestore instance
+const db = admin.firestore ? admin.firestore() : null;
+
+if (!db) {
+    console.error('❌ Firestore not available - check Firebase initialization');
+}
 
 // ===================== HEALTH CHECK =====================
 app.get('/', (req, res) => {
@@ -47,6 +69,7 @@ app.get('/', (req, res) => {
         status: 'OK',
         message: 'Veno-Arena API is running',
         timestamp: new Date().toISOString(),
+        firebaseInitialized: !!admin.apps.length,
         endpoints: [
             '/api/users/:userId',
             '/api/coins/:userId',
@@ -59,6 +82,11 @@ app.get('/', (req, res) => {
 
 // ===================== AUTH MIDDLEWARE =====================
 async function authenticate(req, res, next) {
+    // Check if Firebase is initialized
+    if (!admin.apps.length) {
+        return res.status(503).json({ error: 'Service unavailable - Firebase not initialized' });
+    }
+    
     const token = req.headers.authorization?.split('Bearer ')[1];
     if (!token) {
         return res.status(401).json({ error: 'Unauthorized - No token provided' });
