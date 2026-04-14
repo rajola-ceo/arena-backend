@@ -2,7 +2,6 @@
   "name": "crunk-games",
   "version": "2.0.0",
   "description": "Crunk Games - Real-time Multiplayer Gaming Tournament Platform",
-  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
