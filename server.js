@@ -1,496 +1,374 @@
-// server.js - Veno-Arena Backend API
-const express = require('express');
-const cors = require('cors');
-const admin = require('firebase-admin');
-const path = require('path');
-require('dotenv').config();
+// ============================================================
+// CRUNK GAMES - server.js
+// Node.js + Express + Socket.IO + MongoDB
+// ============================================================
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import * as svc from './services.js';
 
+dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT || 3000;
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }
+});
 
-// Middleware
-app.use(cors({
-    origin: ['http://localhost:5500', 'http://127.0.0.1:5500', 'https://rajola-ceo.github.io'],
-    credentials: true
-}));
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ===================== FIREBASE INITIALIZATION =====================
-// Initialize Firebase Admin SDK with proper environment variable handling
-try {
-    // Check for Firebase credentials in environment variables
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        // Production on Render - use single environment variable
-        console.log('🔐 Initializing Firebase from FIREBASE_SERVICE_ACCOUNT env var...');
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log('✅ Firebase initialized successfully from environment variable');
-    } 
-    else if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL) {
-        // Alternative: Use individual environment variables (if you prefer this method)
-        console.log('🔐 Initializing Firebase from individual env vars...');
-        admin.initializeApp({
-            credential: admin.credential.cert({
-                projectId: process.env.FIREBASE_PROJECT_ID,
-                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-                privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-            })
-        });
-        console.log('✅ Firebase initialized successfully from individual env vars');
-    }
-    else {
-        // Local development - use service account file
-        console.log('📁 Initializing Firebase from local serviceAccountKey.json file...');
-        const serviceAccount = require('./serviceAccountKey.json');
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log('✅ Firebase initialized successfully from local file');
-    }
-} catch (error) {
-    console.error('❌ Firebase Admin initialization error:', error.message);
-    console.error('Stack trace:', error.stack);
-    // Don't exit - let the app start but with limited functionality
-}
+// ─── DB CONNECT ───────────────────────────────────────────────
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => { console.error('❌ MongoDB error:', err); process.exit(1); });
 
-// Get Firestore instance
-const db = admin.firestore ? admin.firestore() : null;
+// ─── AUTH ROUTES ──────────────────────────────────────────────
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const result = await svc.registerUser(req.body);
+    io.emit('leaderboard:update');
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-if (!db) {
-    console.error('❌ Firestore not available - check Firebase initialization');
-}
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const result = await svc.loginUser(req.body);
+    res.json(result);
+  } catch (e) { res.status(401).json({ error: e.message }); }
+});
 
-// ===================== HEALTH CHECK =====================
-app.get('/', (req, res) => {
-    res.json({
-        status: 'OK',
-        message: 'Veno-Arena API is running',
-        timestamp: new Date().toISOString(),
-        firebaseInitialized: !!admin.apps.length,
-        endpoints: [
-            '/api/users/:userId',
-            '/api/coins/:userId',
-            '/api/leagues',
-            '/api/leagues/:leagueId',
-            '/api/teams/:userId'
-        ]
+// ─── USER ROUTES ──────────────────────────────────────────────
+app.get('/api/users/me', svc.authMiddleware, async (req, res) => {
+  try {
+    const user = await svc.getMe(req.userId);
+    res.json(user);
+  } catch (e) { res.status(404).json({ error: e.message }); }
+});
+
+app.put('/api/users/me', svc.authMiddleware, async (req, res) => {
+  try {
+    const user = await svc.updateProfile(req.userId, req.body);
+    io.emit('leaderboard:update');
+    res.json(user);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.get('/api/users', svc.authMiddleware, async (req, res) => {
+  try {
+    const users = await svc.getAllUsers(req.userId);
+    res.json(users);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.put('/api/users/:uid/ban', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.toggleBan(req.userId, req.params.uid, req.body.ban);
+    io.emit('user:updated', { uid: req.params.uid });
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.put('/api/users/:uid/admin', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.toggleAdmin(req.userId, req.params.uid, req.body.isAdmin);
+    io.emit('user:updated', { uid: req.params.uid });
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.post('/api/users/daily-bonus', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.claimDailyBonus(req.userId);
+    io.to(req.userId).emit('coins:update', result);
+    io.emit('leaderboard:update');
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/users/admin/coins', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.adminAdjustCoins(req.userId, req.body);
+    io.to(req.body.targetUid).emit('coins:update', result);
+    io.emit('leaderboard:update');
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.get('/api/users/:uid/coins/history', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.getCoinHistory(req.userId, req.params.uid);
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.get('/api/users/coins/all', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.getAllCoinHistory(req.userId);
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+// ─── LEAGUE ROUTES ────────────────────────────────────────────
+app.get('/api/leagues', svc.authMiddleware, async (req, res) => {
+  try {
+    const leagues = await svc.getLeagues();
+    res.json(leagues);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/leagues', svc.authMiddleware, async (req, res) => {
+  try {
+    const league = await svc.createLeague(req.userId, req.body);
+    io.emit('leagues:update');
+    res.json(league);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.put('/api/leagues/:id', svc.authMiddleware, async (req, res) => {
+  try {
+    const league = await svc.updateLeague(req.userId, req.params.id, req.body);
+    io.emit('leagues:update');
+    res.json(league);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.delete('/api/leagues/:id', svc.authMiddleware, async (req, res) => {
+  try {
+    await svc.deleteLeague(req.userId, req.params.id);
+    io.emit('leagues:update');
+    io.emit('matches:update');
+    io.emit('leaderboard:update');
+    res.json({ ok: true });
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/:id/join', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.joinLeague(req.userId, req.params.id, req.body.teamId);
+    io.emit('leagues:update');
+    io.to(req.userId).emit('coins:update', result.coinData);
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/:id/leave', svc.authMiddleware, async (req, res) => {
+  try {
+    await svc.leaveLeague(req.userId, req.params.id);
+    io.emit('leagues:update');
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/:id/start', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.startLeague(req.userId, req.params.id);
+    io.emit('leagues:update');
+    io.emit('matches:update');
+    io.to(`league:${req.params.id}`).emit('league:started', { leagueId: req.params.id });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/:id/end', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.endLeague(req.userId, req.params.id);
+    io.emit('leagues:update');
+    io.emit('leaderboard:update');
+    io.to(`league:${req.params.id}`).emit('league:ended', result);
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete('/api/leagues/:id/teams/:teamId', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.removeTeamFromLeague(req.userId, req.params.id, req.params.teamId);
+    io.emit('leagues:update');
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+// ─── TEAM ROUTES ──────────────────────────────────────────────
+app.get('/api/teams', svc.authMiddleware, async (req, res) => {
+  try {
+    const teams = await svc.getTeams(req.userId);
+    res.json(teams);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/teams', svc.authMiddleware, async (req, res) => {
+  try {
+    const team = await svc.createTeam(req.userId, req.body);
+    io.emit('leaderboard:update');
+    res.json(team);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.put('/api/teams/:id', svc.authMiddleware, async (req, res) => {
+  try {
+    const team = await svc.updateTeam(req.userId, req.params.id, req.body);
+    io.emit('leaderboard:update');
+    res.json(team);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.delete('/api/teams/:id', svc.authMiddleware, async (req, res) => {
+  try {
+    await svc.deleteTeam(req.userId, req.params.id);
+    io.emit('leagues:update');
+    io.emit('leaderboard:update');
+    res.json({ ok: true });
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+// ─── MATCH ROUTES ─────────────────────────────────────────────
+app.get('/api/matches', svc.authMiddleware, async (req, res) => {
+  try {
+    const matches = await svc.getMatches(req.userId, req.query);
+    res.json(matches);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/matches/:id/submit', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.submitMatchResult(req.userId, req.params.id, req.body);
+    io.emit('matches:update');
+    io.emit('leagues:update');
+    io.emit('leaderboard:update');
+    // notify opponent
+    io.to(result.opponentId).emit('notification', {
+      type: 'info',
+      msg: `Match result submitted. Please confirm: ${result.score}`
     });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ===================== AUTH MIDDLEWARE =====================
-async function authenticate(req, res, next) {
-    // Check if Firebase is initialized
-    if (!admin.apps.length) {
-        return res.status(503).json({ error: 'Service unavailable - Firebase not initialized' });
-    }
-    
-    const token = req.headers.authorization?.split('Bearer ')[1];
-    if (!token) {
-        return res.status(401).json({ error: 'Unauthorized - No token provided' });
-    }
-    
+app.post('/api/matches/:id/confirm', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.confirmMatchResult(req.userId, req.params.id);
+    io.emit('matches:update');
+    io.emit('leaderboard:update');
+    io.to(result.submitterId).emit('notification', { type: 'success', msg: 'Match result confirmed! +' + result.reward + ' coins' });
+    io.to(result.submitterId).emit('coins:update', result.coinData);
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/matches/:id/dispute', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.disputeMatch(req.userId, req.params.id, req.body.reason);
+    io.emit('matches:update');
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/matches/:id/admin-override', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.adminOverrideMatch(req.userId, req.params.id, req.body);
+    io.emit('matches:update');
+    io.emit('leaderboard:update');
+    res.json(result);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+// ─── LEADERBOARD ──────────────────────────────────────────────
+app.get('/api/leaderboard/players', async (req, res) => {
+  try {
+    const data = await svc.getPlayersLeaderboard();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/leaderboard/teams', async (req, res) => {
+  try {
+    const data = await svc.getTeamsLeaderboard();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── ANNOUNCEMENTS ────────────────────────────────────────────
+app.get('/api/announcements', async (req, res) => {
+  try {
+    const data = await svc.getAnnouncements();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/announcements', svc.authMiddleware, async (req, res) => {
+  try {
+    const a = await svc.postAnnouncement(req.userId, req.body);
+    io.emit('announcements:update');
+    io.emit('notification', { type: 'info', msg: `📢 ${a.title}` });
+    res.json(a);
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+app.delete('/api/announcements/:id', svc.authMiddleware, async (req, res) => {
+  try {
+    await svc.deleteAnnouncement(req.userId, req.params.id);
+    io.emit('announcements:update');
+    res.json({ ok: true });
+  } catch (e) { res.status(403).json({ error: e.message }); }
+});
+
+// ─── CHAT ─────────────────────────────────────────────────────
+app.get('/api/chat/:leagueId', svc.authMiddleware, async (req, res) => {
+  try {
+    const messages = await svc.getChatMessages(req.params.leagueId);
+    res.json(messages);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── UPLOAD (Cloudinary) ──────────────────────────────────────
+app.post('/api/upload', svc.authMiddleware, async (req, res) => {
+  try {
+    const result = await svc.uploadImage(req.body.data, req.body.folder || 'matches');
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── SOCKET.IO ────────────────────────────────────────────────
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error('No token'));
+    const payload = svc.verifyToken(token);
+    socket.userId = payload.uid;
+    next();
+  } catch { next(new Error('Invalid token')); }
+});
+
+io.on('connection', (socket) => {
+  const uid = socket.userId;
+  console.log(`⚡ Socket connected: ${uid}`);
+  socket.join(uid); // personal room
+
+  socket.on('join:league', (leagueId) => socket.join(`league:${leagueId}`));
+  socket.on('leave:league', (leagueId) => socket.leave(`league:${leagueId}`));
+
+  socket.on('chat:send', async (data) => {
     try {
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        req.user = decodedToken;
-        next();
-    } catch (error) {
-        console.error('Auth error:', error);
-        res.status(401).json({ error: 'Unauthorized - Invalid token' });
-    }
-}
+      const msg = await svc.saveChatMessage(uid, data.leagueId, data.text);
+      io.to(`league:${data.leagueId}`).emit('chat:message', msg);
+    } catch (e) { socket.emit('error', e.message); }
+  });
 
-// ===================== USER ROUTES =====================
-// Get user profile
-app.get('/api/users/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        const userDoc = await db.collection('users').doc(req.params.userId).get();
-        if (!userDoc.exists) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        res.json({ id: userDoc.id, ...userDoc.data() });
-    } catch (error) {
-        console.error('Error getting user:', error);
-        res.status(500).json({ error: error.message });
-    }
+  socket.on('disconnect', () => console.log(`❌ Socket disconnected: ${uid}`));
 });
 
-// Create or update user profile
-app.post('/api/users/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        const userData = {
-            ...req.body,
-            uid: req.params.userId,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        
-        await db.collection('users').doc(req.params.userId).set(userData, { merge: true });
-        res.json({ success: true, user: userData });
-    } catch (error) {
-        console.error('Error creating user:', error);
-        res.status(500).json({ error: error.message });
-    }
+// ─── SERVE FRONTEND ───────────────────────────────────────────
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Update user profile
-app.put('/api/users/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        await db.collection('users').doc(req.params.userId).update({
-            ...req.body,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error updating user:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===================== COIN ROUTES =====================
-// Get user coins
-app.get('/api/coins/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        const coinDoc = await db.collection('userCoins').doc(req.params.userId).get();
-        const balance = coinDoc.exists ? coinDoc.data().balance : 100;
-        
-        res.json({ balance });
-    } catch (error) {
-        console.error('Error getting coins:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Claim daily reward
-app.post('/api/coins/:userId/claim', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        // Check last claim
-        const claimDoc = await db.collection('dailyClaims').doc(req.params.userId).get();
-        const lastClaim = claimDoc.exists ? claimDoc.data().lastClaim.toDate() : null;
-        
-        if (lastClaim && (Date.now() - lastClaim.getTime()) < 24 * 60 * 60 * 1000) {
-            return res.status(400).json({ error: 'Already claimed today' });
-        }
-        
-        // Get current coins
-        const coinDoc = await db.collection('userCoins').doc(req.params.userId).get();
-        const currentBalance = coinDoc.exists ? coinDoc.data().balance : 100;
-        const newBalance = currentBalance + 10;
-        
-        // Update coins
-        await db.collection('userCoins').doc(req.params.userId).set({
-            balance: newBalance,
-            totalEarned: admin.firestore.FieldValue.increment(10),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        
-        // Record claim
-        await db.collection('dailyClaims').doc(req.params.userId).set({
-            userId: req.params.userId,
-            lastClaim: admin.firestore.FieldValue.serverTimestamp(),
-            amount: 10
-        });
-        
-        // Record transaction
-        await db.collection('transactions').add({
-            userId: req.params.userId,
-            amount: 10,
-            type: 'earn',
-            reason: 'daily_reward',
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        res.json({ success: true, amount: 10, newBalance });
-    } catch (error) {
-        console.error('Error claiming daily:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===================== LEAGUE ROUTES =====================
-// Get all leagues
-app.get('/api/leagues', authenticate, async (req, res) => {
-    try {
-        let query = db.collection('leagues').orderBy('createdAt', 'desc');
-        
-        if (req.query.status) {
-            query = query.where('status', '==', req.query.status);
-        }
-        
-        const snapshot = await query.get();
-        const leagues = [];
-        snapshot.forEach(doc => {
-            leagues.push({ id: doc.id, ...doc.data() });
-        });
-        
-        res.json(leagues);
-    } catch (error) {
-        console.error('Error getting leagues:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get single league
-app.get('/api/leagues/:leagueId', authenticate, async (req, res) => {
-    try {
-        const leagueDoc = await db.collection('leagues').doc(req.params.leagueId).get();
-        if (!leagueDoc.exists) {
-            return res.status(404).json({ error: 'League not found' });
-        }
-        
-        res.json({ id: leagueDoc.id, ...leagueDoc.data() });
-    } catch (error) {
-        console.error('Error getting league:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Create league
-app.post('/api/leagues', authenticate, async (req, res) => {
-    try {
-        const leagueData = {
-            ...req.body,
-            ownerId: req.user.uid,
-            ownerName: req.body.ownerName || req.user.displayName,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            status: 'registration',
-            teams: [],
-            matches: [],
-            pendingRequests: []
-        };
-        
-        const docRef = await db.collection('leagues').add(leagueData);
-        res.json({ id: docRef.id, ...leagueData });
-    } catch (error) {
-        console.error('Error creating league:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Join league
-app.post('/api/leagues/:leagueId/join', authenticate, async (req, res) => {
-    try {
-        const leagueRef = db.collection('leagues').doc(req.params.leagueId);
-        const leagueDoc = await leagueRef.get();
-        
-        if (!leagueDoc.exists) {
-            return res.status(404).json({ error: 'League not found' });
-        }
-        
-        const league = leagueDoc.data();
-        
-        // Check if already joined
-        if (league.teams?.some(t => t.ownerId === req.user.uid)) {
-            return res.status(400).json({ error: 'Already joined this league' });
-        }
-        
-        // Check if league is full
-        if (league.teams?.length >= league.maxTeams) {
-            return res.status(400).json({ error: 'League is full' });
-        }
-        
-        // Check entry fee
-        const coinDoc = await db.collection('userCoins').doc(req.user.uid).get();
-        const userCoins = coinDoc.exists ? coinDoc.data().balance : 100;
-        
-        if (userCoins < league.entryFee) {
-            return res.status(400).json({ error: 'Insufficient coins' });
-        }
-        
-        // Deduct coins
-        await db.collection('userCoins').doc(req.user.uid).set({
-            balance: userCoins - league.entryFee,
-            totalSpent: admin.firestore.FieldValue.increment(league.entryFee),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        
-        // Record transaction
-        await db.collection('transactions').add({
-            userId: req.user.uid,
-            amount: league.entryFee,
-            type: 'spend',
-            reason: 'join_league',
-            leagueId: req.params.leagueId,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        // Add team to league
-        const newTeam = {
-            id: `team_${Date.now()}`,
-            name: `${req.body.teamName || req.user.displayName}'s Team`,
-            ownerId: req.user.uid,
-            ownerName: req.user.displayName,
-            logo: req.user.photoURL,
-            joinedAt: new Date().toISOString()
-        };
-        
-        await leagueRef.update({
-            teams: admin.firestore.FieldValue.arrayUnion(newTeam)
-        });
-        
-        res.json({ success: true, team: newTeam });
-    } catch (error) {
-        console.error('Error joining league:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Update league (for owner)
-app.put('/api/leagues/:leagueId', authenticate, async (req, res) => {
-    try {
-        const leagueDoc = await db.collection('leagues').doc(req.params.leagueId).get();
-        
-        if (!leagueDoc.exists) {
-            return res.status(404).json({ error: 'League not found' });
-        }
-        
-        const league = leagueDoc.data();
-        
-        if (league.ownerId !== req.user.uid) {
-            return res.status(403).json({ error: 'Only league owner can update' });
-        }
-        
-        await db.collection('leagues').doc(req.params.leagueId).update({
-            ...req.body,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error updating league:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===================== TEAM ROUTES =====================
-// Get user's teams
-app.get('/api/teams/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        const snapshot = await db.collection('teams')
-            .where('ownerId', '==', req.params.userId)
-            .orderBy('createdAt', 'desc')
-            .get();
-        
-        const teams = [];
-        snapshot.forEach(doc => {
-            teams.push({ id: doc.id, ...doc.data() });
-        });
-        
-        res.json(teams);
-    } catch (error) {
-        console.error('Error getting teams:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Create team
-app.post('/api/teams', authenticate, async (req, res) => {
-    try {
-        const teamData = {
-            ...req.body,
-            ownerId: req.user.uid,
-            ownerName: req.user.displayName,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            stats: {
-                wins: 0,
-                draws: 0,
-                losses: 0,
-                matchesPlayed: 0,
-                goalsFor: 0,
-                goalsAgainst: 0
-            }
-        };
-        
-        const docRef = await db.collection('teams').add(teamData);
-        res.json({ id: docRef.id, ...teamData });
-    } catch (error) {
-        console.error('Error creating team:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===================== NOTIFICATION ROUTES =====================
-// Get user's notifications
-app.get('/api/notifications/:userId', authenticate, async (req, res) => {
-    try {
-        if (req.params.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        const snapshot = await db.collection('notifications')
-            .where('userId', '==', req.params.userId)
-            .orderBy('createdAt', 'desc')
-            .limit(50)
-            .get();
-        
-        const notifications = [];
-        snapshot.forEach(doc => {
-            notifications.push({ id: doc.id, ...doc.data() });
-        });
-        
-        res.json(notifications);
-    } catch (error) {
-        console.error('Error getting notifications:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Mark notification as read
-app.put('/api/notifications/:notificationId/read', authenticate, async (req, res) => {
-    try {
-        const notifDoc = await db.collection('notifications').doc(req.params.notificationId).get();
-        
-        if (!notifDoc.exists) {
-            return res.status(404).json({ error: 'Notification not found' });
-        }
-        
-        const notif = notifDoc.data();
-        
-        if (notif.userId !== req.user.uid) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        
-        await db.collection('notifications').doc(req.params.notificationId).update({
-            read: true
-        });
-        
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error marking notification read:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===================== START SERVER =====================
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📍 Local: http://localhost:${PORT}`);
-    console.log(`✅ Ready to accept requests`);
-});
+// ─── START ────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
